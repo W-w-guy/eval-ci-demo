@@ -1,0 +1,118 @@
+# 回归评测接入 CI（#2062）
+# 关键设计：自托管 runner + 数据不出客户网络；密钥只从 secrets 注入、绝不打印。
+name: eval
+
+on:
+  pull_request:
+    paths:
+      - "prompts/**"
+      - "evals/**"
+      - "app/**"
+      - ".github/workflows/eval.yml"
+  schedule:
+    # 每天 02:00（UTC+8）夜间全量回归：UTC 18:00
+    - cron: "0 18 * * *"
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: "指定要跑的套件（留空=按触发方式自动选）"
+        required: false
+        default: ""
+
+# 同一 PR 有新提交时取消旧运行（AC：取消旧运行）
+concurrency:
+  group: eval-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  actions: read
+
+jobs:
+  eval:
+    # 关键：self-hosted，数据与被测服务不出客户网络
+    runs-on: [self-hosted, linux, eval-runner]
+    timeout-minutes: 20          # AC4：冒烟集总耗时 ≤20 分钟
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 环境自检
+        run: |
+          python3 -V
+          echo "runner=$RUNNER_NAME host=$RUNNER_NAME"
+          echo "event=${{ github.event_name }} ref=${{ github.ref }}"
+
+      - name: eval-lint
+        run: python3 scripts/eval_lint.py
+
+      - name: eval-pii-scan
+        run: python3 scripts/eval_pii_scan.py
+
+      - name: 确定本次套件（PR=冒烟 / 夜间=全量）
+        id: pick
+        run: |
+          SUITE="${{ github.event.inputs.suite }}"
+          if [ -z "$SUITE" ]; then
+            if [ "${{ github.event_name }}" = "pull_request" ]; then SUITE="smoke"; else SUITE="regression"; fi
+          fi
+          echo "suite=$SUITE" >> "$GITHUB_OUTPUT"
+          echo "选中套件：$SUITE"
+
+      - name: eval-run（启动评测模式并跑用例）
+        env:
+          # 密钥只从 secrets 注入；脚本内部用 mask 保护，日志不打印
+          EVAL_MODEL_KEY: ${{ secrets.EVAL_MODEL_KEY }}
+          EVAL_MODEL_URL: ${{ secrets.EVAL_MODEL_URL }}
+        run: |
+          echo "::add-mask::$EVAL_MODEL_KEY"
+          echo "::add-mask::$EVAL_MODEL_URL"
+          python3 scripts/eval_run.py --suite "${{ steps.pick.outputs.suite }}" \
+                  --report-dir reports --record reports/run.json
+
+      - name: eval-gate（护栏）与回归判定
+        run: |
+          python3 scripts/eval_gate.py --run-report reports/run.json \
+                  --baseline evals/baseline.json
+
+      - name: eval-report（HTML + Markdown 摘要）
+        if: always()
+        run: python3 scripts/eval_report.py --run-report reports/run.json --out reports
+
+      - name: 上传 HTML 报告（保留 30 天）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-report
+          path: reports/
+          retention-days: 30
+
+      - name: PR 评论（同一 PR 更新同一条，不重复新增）
+        if: always() && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 scripts/pr_comment.py \
+            --repo "${{ github.repository }}" \
+            --pr "${{ github.event.pull_request.number }}" \
+            --body-file reports/summary.md \
+            --marker "<!-- eval-ci-report -->"
+
+      - name: 夜间全量失败 -> 站内通知
+        if: failure() && github.event_name == 'schedule'
+        env:
+          NOTIFY_URL: ${{ secrets.NOTIFY_WEBHOOK }}
+        run: |
+          echo "::add-mask::$NOTIFY_URL"
+          python3 scripts/notify.py --url "$NOTIFY_URL" \
+            --text "夜间全量回归失败：${{ github.run_id }}"
+
+      - name: 耗时记录
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import json, os, datetime
+          started = datetime.datetime.now(datetime.timezone.utc)
+          rec = {"suite": os.environ.get("SUITE", ""), "at": started.isoformat()}
+          print("耗时由 run.json 统计")
+          PY

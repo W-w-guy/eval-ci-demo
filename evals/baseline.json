@@ -1,0 +1,6 @@
+{
+ "pass_rate_pct": 100.0,
+ "note": "baseline：v1 提示词下的通过率（首次建立）",
+ "suite": "smoke",
+ "created": "2026-11-21"
+}
