@@ -22,6 +22,9 @@ SKIP_EXT = {".pyc", ".png", ".jpg", ".gif", ".zip", ".gz", ".tgz", ".whl"}
 SKIP_DIR = {".git", "__pycache__", "node_modules", "reports"}
 # 允许出现的占位/示例（不是真值）
 SAFE = ("1990000", "example.invalid", "XXXX", "placeholder", "${{", "%s", "<", ">")
+# VCS 自身的服务地址不是真实联系方式（误报来源：PR JSON 里的 git@github.com）
+VCS_ADDR = ("git@github.com", "git@gitlab.com", "noreply@github.com",
+            "actions@github.com", "41898282+github-actions[bot]@users.noreply.github.com")
 
 
 def main():
@@ -40,6 +43,8 @@ def main():
                 for m in rx.finditer(t):
                     v = m.group(0)
                     if any(s in v for s in SAFE):
+                        continue
+                    if v in VCS_ADDR or v.startswith("git@"):
                         continue
                     # 环境变量引用不是明文
                     if v.startswith("$") or v.startswith("%"):
